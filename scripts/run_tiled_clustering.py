@@ -43,6 +43,11 @@ logging.getLogger().setLevel(logging.INFO)
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)s %(message)s',
                     datefmt='%Y-%m-%dT%H:%M:%S',
                     level=logging.INFO)
+file_handler = logging.FileHandler("run-tiled-clustering.log", mode='a')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s,%(msecs)d %(levelname)s %(message)s',
+                                            datefmt='%Y-%m-%dT%H:%M:%S'))
+logging.getLogger().addHandler(file_handler)
 
 
 @dataclasses.dataclass
@@ -92,6 +97,21 @@ class Config:
             self.profile_output_dir.mkdir(parents=True, exist_ok=True)
 
 
+class ListAction(argparse.Action):
+    """Custom action to handle list arguments with comma or space separation."""
+    def __init__(self, option_strings, dest, default=None, default_factory=None, **kwargs):
+        self.default_factory = default_factory
+        # Remove default_factory from kwargs before passing to parent
+        kwargs.pop('default_factory', None)
+        super().__init__(option_strings, dest, default=default or [], **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # Handle comma-separated string if single value contains commas
+        if isinstance(values, list) and len(values) == 1 and isinstance(values[0], str) and ',' in values[0]:
+            values = [x.strip() for x in values[0].split(',')]
+        setattr(namespace, self.dest, values)
+
+
 def create_args() -> argparse.ArgumentParser:
     """Create an ArgumentParser from the Config dataclass."""
     parser = argparse.ArgumentParser(description="Run image classifier on organoid images")
@@ -138,21 +158,6 @@ def create_args() -> argparse.ArgumentParser:
 
     return parser
 
-class ListAction(argparse.Action):
-    """Custom action to handle list arguments with comma or space separation."""
-    def __init__(self, option_strings, dest, default=None, default_factory=None, **kwargs):
-        self.default_factory = default_factory
-        # Remove default_factory from kwargs before passing to parent
-        kwargs.pop('default_factory', None)
-        super().__init__(option_strings, dest, default=default or [], **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        # Handle comma-separated string if single value contains commas
-        if isinstance(values, list) and len(values) == 1 and isinstance(values[0], str) and ',' in values[0]:
-            values = [x.strip() for x in values[0].split(',')]
-        setattr(namespace, self.dest, values)
-
-
 def _tuple_parser(value: str, element_types: tuple):
     """Parse comma-separated string into a tuple with specified types."""
     parts = [float(x.strip()) for x in value.split(',')]
@@ -161,7 +166,6 @@ def _tuple_parser(value: str, element_types: tuple):
             f"Expected {len(element_types)} values separated by commas"
         )
     return tuple(parts)
-
 
 def get_args():
     arg_parser = create_args()
@@ -189,7 +193,7 @@ def generate_data(cfg: Config):
     x = torch.rand(cfg.num_obs)
     y = torch.rand(cfg.num_obs)
     X = torch.stack([x, y], dim=1)  # (N, 2) -- kept for clarity/optionally used later
-    plot_scatter(x, y, cfg.out_dir / "random_uniform_data.png")
+    plot_scatter(x, y, cfg.plot_dir / "random_uniform_data.png")
 
     # Generate factors
     t1 = torch.randint(0, 2, (cfg.num_features,), dtype=torch.float32)  # {0,1}
@@ -218,8 +222,8 @@ def generate_data(cfg: Config):
     factor[mask1] = 1
     factor[mask2] = 2
     factor[mask3] = 3
-    plot_factor_visualization(x, y, b1, b2, factor, cfg.out_dir / "factor_visualization.png")
-    plot_individual_factors(x, y, b1, b2, L, f, cfg.out_dir / "individual_factors.png")
+    plot_factor_visualization(x, y, b1, b2, factor, cfg.plot_dir / "factor_visualization.png")
+    plot_individual_factors(x, y, b1, b2, L, f, cfg.plot_dir / "individual_factors.png")
 
     # Generate observations
     noise = cfg.noise_std * torch.randn(cfg.num_obs, cfg.num_features)
@@ -248,6 +252,10 @@ def fit_models(data: torch.Tensor, X: torch.Tensor, prior_list: list[str], devic
     """
     models = {}
     for prior in prior_list:
+        logging.info(f"\n{'='*80}")
+        logging.info(f"Fitting model with prior: {prior}")
+        logging.info(f"{'='*80}")
+
         if prior == "None":
             mycebmf = cEBMF(data=data, device=device)
         else:
@@ -257,13 +265,36 @@ def fit_models(data: torch.Tensor, X: torch.Tensor, prior_list: list[str], devic
                             allow_backfitting=False,
                             device=device)
 
+        # Verify model tensors are on the correct device
+        logging.info("Verifying model tensor devices:")
+        verify_tensor_device(mycebmf.Y, f"model.Y ({prior})", device)
+        if mycebmf.covariate.X_l is not None:
+            verify_tensor_device(mycebmf.covariate.X_l, f"model.X_l ({prior})", device)
+        if hasattr(mycebmf, 'L') and mycebmf.L is not None:
+            verify_tensor_device(mycebmf.L, f"model.L ({prior})", device)
+        if hasattr(mycebmf, 'F') and mycebmf.F is not None:
+            verify_tensor_device(mycebmf.F, f"model.F ({prior})", device)
+
         mycebmf.initialise_factors()
+
+        # Log GPU memory usage before fitting
+        if torch.cuda.is_available():
+            memory_allocated_before = torch.cuda.memory_allocated() / (1024**2)  # MB
+            memory_reserved_before = torch.cuda.memory_reserved() / (1024**2)  # MB
+            logging.info(f"GPU memory before fitting: allocated={memory_allocated_before:.2f} MB, reserved={memory_reserved_before:.2f} MB")
 
         # Profile model fitting if enabled
         if profile:
             profile_model_fitting(mycebmf, prior, niter, profile_output_dir, profile_iterations)
         else:
             mycebmf.fit(niter)
+
+        # Log GPU memory usage after fitting
+        if torch.cuda.is_available():
+            memory_allocated_after = torch.cuda.memory_allocated() / (1024**2)  # MB
+            memory_reserved_after = torch.cuda.memory_reserved() / (1024**2)  # MB
+            logging.info(f"GPU memory after fitting: allocated={memory_allocated_after:.2f} MB, reserved={memory_reserved_after:.2f} MB")
+            logging.info(f"GPU memory increase: allocated={memory_allocated_after - memory_allocated_before:.2f} MB")
 
         models[prior] = mycebmf
         logging.info(f"Fitted model with prior {prior}")
@@ -412,12 +443,12 @@ def plot_individual_factors(x: torch.Tensor, y: torch.Tensor, b1: float, b2: flo
     plt.close()
     logging.info(f"Saved individual factors plot to {out_path}")
 
-def plot_models(models: dict, out_dir: pathlib.Path):
+def plot_models(models: dict, plot_dir: pathlib.Path):
     """Plot ELBO (objective) values for each fitted model.
 
     Args:
         models: Dictionary mapping prior names to fitted cEBMF model objects
-        out_dir: Output directory where plots will be saved
+        plot_dir: Output directory where plots will be saved
     """
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -437,7 +468,7 @@ def plot_models(models: dict, out_dir: pathlib.Path):
     plt.tight_layout()
 
     # Save the plot instead of showing it
-    output_path = out_dir / "elbo_convergence.png"
+    output_path = plot_dir / "elbo_convergence.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     logging.info(f"Saved ELBO plot to {output_path}")
@@ -448,13 +479,13 @@ def _to1d(a):
         return a.detach().cpu().flatten().numpy()
     return np.asarray(a).ravel()
 
-def plot_factors(models: dict, X: torch.Tensor, out_dir: pathlib.Path):
+def plot_factors(models: dict, X: torch.Tensor, plot_dir: pathlib.Path):
     """Plot comparison of fitted factors across all models.
 
     Args:
         models: Dictionary mapping prior names to fitted cEBMF model objects
         X: Covariate matrix with shape (N, 2) where first column is x coordinates
-        out_dir: Output directory where plots will be saved
+        plot_dir: Output directory where plots will be saved
     """
     # Extract x coordinates from X (first column)
     x = X[:, 0]
@@ -486,15 +517,96 @@ def plot_factors(models: dict, X: torch.Tensor, out_dir: pathlib.Path):
         plt.tight_layout()
 
         # Save the plot
-        output_path = out_dir / f"factor_{k+1}_comparison.png"
+        output_path = plot_dir / f"factor_{k+1}_comparison.png"
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         logging.info(f"Saved factor {k+1} comparison plot to {output_path}")
 
+def log_gpu_info():
+    """Log comprehensive GPU information and diagnostics."""
+    logging.info("="*80)
+    logging.info("GPU DIAGNOSTICS")
+    logging.info("="*80)
+
+    # Check CUDA availability
+    cuda_available = torch.cuda.is_available()
+    logging.info(f"CUDA available: {cuda_available}")
+
+    if cuda_available:
+        # GPU count and names
+        num_gpus = torch.cuda.device_count()
+        logging.info(f"Number of GPUs: {num_gpus}")
+        for i in range(num_gpus):
+            gpu_name = torch.cuda.get_device_name(i)
+            logging.info(f"  GPU {i}: {gpu_name}")
+
+        # Current device
+        current_device = torch.cuda.current_device()
+        logging.info(f"Current CUDA device index: {current_device}")
+        logging.info(f"Current CUDA device name: {torch.cuda.get_device_name(current_device)}")
+
+        # Memory information
+        for i in range(num_gpus):
+            props = torch.cuda.get_device_properties(i)
+            memory_total = props.total_memory / (1024**3)  # GB
+            logging.info(f"  GPU {i} total memory: {memory_total:.2f} GB")
+
+        # Test tensor creation on GPU
+        try:
+            test_tensor = torch.randn(10, 10, device="cuda")
+            logging.info(f"✓ Successfully created test tensor on GPU")
+            logging.info(f"  Test tensor device: {test_tensor.device}")
+            logging.info(f"  Test tensor location: {test_tensor.device.type}:{test_tensor.device.index if test_tensor.device.index is not None else 'default'}")
+            del test_tensor
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logging.error(f"✗ Failed to create tensor on GPU: {e}")
+    else:
+        logging.info("No CUDA devices available - will use CPU")
+
+    logging.info("="*80)
+
+
+def verify_tensor_device(tensor: torch.Tensor, name: str, expected_device: torch.device):
+    """Verify that a tensor is on the expected device and log the result.
+    
+    This function compares device type and index, treating cuda and cuda:0 as equivalent.
+    """
+    actual_device = tensor.device
+    
+    # Normalize devices for comparison (cuda -> cuda:0, etc.)
+    # Get actual device index (default to 0 for CUDA if None)
+    actual_index = actual_device.index if actual_device.index is not None else 0
+    expected_index = expected_device.index if expected_device.index is not None else 0
+    
+    # Compare device type and index
+    type_match = actual_device.type == expected_device.type
+    index_match = actual_index == expected_index
+    
+    is_correct = type_match and index_match
+
+    status = "✓" if is_correct else "✗"
+    logging.info(f"{status} {name}: device={actual_device}, expected={expected_device}")
+
+    if not is_correct:
+        logging.warning(f"  WARNING: {name} is on {actual_device} but expected {expected_device}")
+
+    return is_correct
+
+
 def main():
     start = datetime.datetime.now()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logging.info(f"Using device: {device}")
+
+    # Set up device
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)  # Set default CUDA device to index 0
+        device = torch.device("cuda:0")  # Use explicit index for consistent comparison
+    else:
+        device = torch.device("cpu")
+
+    # Log comprehensive GPU information
+    log_gpu_info()
+    logging.info(f"Selected device: {device}")
 
     cfg = get_args()
 
@@ -505,11 +617,15 @@ def main():
     # torch.backends.cudnn.benchmark = False
     # torch.use_deterministic_algorithms(True)
     # torch.backends.cudnn.enabled = False
-    # torch.cuda.set_device(device)
 
     # Generate data
     data, X = generate_data(cfg)
     logging.info(f"Generated data")
+
+    # Verify data tensors are on the correct device (cEBMF will move them, but let's check)
+    logging.info("Verifying data tensor devices:")
+    verify_tensor_device(data, "data", device)
+    verify_tensor_device(X, "X", device)
 
     # Fit the model
     models = fit_models(data, X, cfg.prior_list, device, cfg.niter,
@@ -519,8 +635,8 @@ def main():
     logging.info(f"Fitted models")
 
     # Visualize the models
-    plot_models(models, cfg.out_dir)
-    plot_factors(models, X, cfg.out_dir)
+    plot_models(models, cfg.plot_dir)
+    plot_factors(models, X, cfg.plot_dir)
 
     end = datetime.datetime.now()
     logging.info(f"Elapsed time: {end - start}")
