@@ -149,3 +149,10 @@ Thumbs.db
 
 docs/source/notebooks
 tests/doc_examples_test.py
+
+output/
+
+profiles/
+*.prof
+*.lprof
+mprofile_*.dat

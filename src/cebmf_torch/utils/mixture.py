@@ -141,7 +141,7 @@ def _calculate_scales(
     return torch.cat(
         [
             torch.tensor([0.0], device=device, dtype=dtype),
-            (1.0 / mult) ** (-seq.to(dtype=torch.float64)).to(dtype)
+            (1.0 / mult) ** (-seq.to(dtype=torch.float32)).to(dtype)
             * torch.tensor(sigmaamax, device=device, dtype=dtype),
         ]
     )
