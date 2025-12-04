@@ -43,11 +43,11 @@ logging.getLogger().setLevel(logging.INFO)
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)s %(message)s',
                     datefmt='%Y-%m-%dT%H:%M:%S',
                     level=logging.INFO)
-file_handler = logging.FileHandler("run-tiled-clustering.log", mode='a')
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter('%(asctime)s,%(msecs)d %(levelname)s %(message)s',
-                                            datefmt='%Y-%m-%dT%H:%M:%S'))
-logging.getLogger().addHandler(file_handler)
+# file_handler = logging.FileHandler("/net/scratch/ntebaldi/cebmf-data/logs/run-tiled-clustering.log", mode='a')
+# file_handler.setLevel(logging.INFO)
+# file_handler.setFormatter(logging.Formatter('%(asctime)s,%(msecs)d %(levelname)s %(message)s',
+#                                             datefmt='%Y-%m-%dT%H:%M:%S'))
+# logging.getLogger().addHandler(file_handler)
 
 
 @dataclasses.dataclass
@@ -279,25 +279,52 @@ def fit_models(data: torch.Tensor, X: torch.Tensor, prior_list: list[str], devic
 
         # Log GPU memory usage before fitting
         if torch.cuda.is_available():
+            # Reset peak memory stats to track peak during fitting
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()  # Clear any cached memory
+
             memory_allocated_before = torch.cuda.memory_allocated() / (1024**2)  # MB
             memory_reserved_before = torch.cuda.memory_reserved() / (1024**2)  # MB
             logging.info(f"GPU memory before fitting: allocated={memory_allocated_before:.2f} MB, reserved={memory_reserved_before:.2f} MB")
 
         # Profile model fitting if enabled
+        if torch.cuda.is_available():
+            # Create CUDA events to measure GPU time
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+
         if profile:
             profile_model_fitting(mycebmf, prior, niter, profile_output_dir, profile_iterations)
         else:
             mycebmf.fit(niter)
 
+        if torch.cuda.is_available():
+            end_event.record()
+            torch.cuda.synchronize()  # Wait for GPU operations to complete
+            gpu_time_ms = start_event.elapsed_time(end_event)
+            logging.info(f"GPU computation time: {gpu_time_ms:.2f} ms ({gpu_time_ms/1000:.2f} seconds)")
+
         # Log GPU memory usage after fitting
         if torch.cuda.is_available():
             memory_allocated_after = torch.cuda.memory_allocated() / (1024**2)  # MB
             memory_reserved_after = torch.cuda.memory_reserved() / (1024**2)  # MB
+            memory_peak_allocated = torch.cuda.max_memory_allocated() / (1024**2)  # MB - peak during fitting
+            memory_peak_reserved = torch.cuda.max_memory_reserved() / (1024**2)  # MB - peak reserved
+
             logging.info(f"GPU memory after fitting: allocated={memory_allocated_after:.2f} MB, reserved={memory_reserved_after:.2f} MB")
+            logging.info(f"GPU memory peak during fitting: allocated={memory_peak_allocated:.2f} MB, reserved={memory_peak_reserved:.2f} MB")
             logging.info(f"GPU memory increase: allocated={memory_allocated_after - memory_allocated_before:.2f} MB")
+            logging.info(f"GPU memory peak increase: allocated={memory_peak_allocated - memory_allocated_before:.2f} MB")
 
         models[prior] = mycebmf
         logging.info(f"Fitted model with prior {prior}")
+
+        # Clear GPU cache between models to prevent memory accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            memory_after_model = torch.cuda.memory_allocated() / (1024**2)  # MB
+            logging.info(f"GPU memory after model '{prior}': {memory_after_model:.2f} MB")
 
     return models
 
@@ -312,19 +339,37 @@ def profile_model_fitting(model: cEBMF, prior_name: str, niter: int, profile_out
         profile_output_dir: Directory to save profiling results
         profile_iterations: Number of iterations to profile (None = all)
     """
+    # Clear GPU cache before profiling to reduce memory pressure
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        memory_before = torch.cuda.memory_allocated() / (1024**2)  # MB
+        memory_reserved = torch.cuda.memory_reserved() / (1024**2)  # MB
+        memory_total = torch.cuda.get_device_properties(0).total_memory / (1024**2)  # MB
+        memory_available = memory_total - memory_reserved
+
+        logging.info(f"GPU memory before profiling: allocated={memory_before:.2f} MB, reserved={memory_reserved:.2f} MB")
+        logging.info(f"GPU memory available: {memory_available:.2f} MB / {memory_total:.2f} MB")
+
+        if memory_available < 500:  # Warn if less than 500 MB available
+            logging.warning(f"Low GPU memory available ({memory_available:.2f} MB). Profiling may cause OOM.")
+
     # Configure profiler activities
     activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
 
     # Determine how many iterations to profile
     profile_niter = profile_iterations if profile_iterations else niter
     logging.info(f"Profiling model '{prior_name}' for {profile_niter} iterations...")
 
     # Profile the model fitting
+    # Note: record_shapes, profile_memory, and with_stack increase memory usage significantly
+    # Disable profile_memory to reduce OOM risk
     with torch.profiler.profile(
         activities=activities,
-        record_shapes=True,
-        profile_memory=True,  # Set to True if you want memory profiling
-        with_stack=True,
+        record_shapes=False,  # Disable to reduce memory overhead
+        profile_memory=False,  # Disable memory profiling to reduce OOM risk
+        with_stack=False,  # Disable stack traces to reduce memory overhead
     ) as prof:
         with torch.profiler.record_function(f"model_fitting_{prior_name}"):
             model.fit(profile_niter)
@@ -335,9 +380,18 @@ def profile_model_fitting(model: cEBMF, prior_name: str, niter: int, profile_out
         logging.info(f"Continuing to fit remaining {remaining} iterations without profiling...")
         model.fit(remaining)
 
+    # Clear GPU cache after profiling to free up memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Export profiling results
     logging.info(f"Exporting profiling results for '{prior_name}'...")
     record_profile(prof, prior_name, profile_output_dir)
+
+    # Clear profiler object to free memory
+    del prof
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def record_profile(prof: torch.profiler.profile, prior_name: str, profile_output_dir: pathlib.Path):
     """Record the profile of the model fitting process using torch.profiler.
@@ -569,20 +623,20 @@ def log_gpu_info():
 
 def verify_tensor_device(tensor: torch.Tensor, name: str, expected_device: torch.device):
     """Verify that a tensor is on the expected device and log the result.
-    
+
     This function compares device type and index, treating cuda and cuda:0 as equivalent.
     """
     actual_device = tensor.device
-    
+
     # Normalize devices for comparison (cuda -> cuda:0, etc.)
     # Get actual device index (default to 0 for CUDA if None)
     actual_index = actual_device.index if actual_device.index is not None else 0
     expected_index = expected_device.index if expected_device.index is not None else 0
-    
+
     # Compare device type and index
     type_match = actual_device.type == expected_device.type
     index_match = actual_index == expected_index
-    
+
     is_correct = type_match and index_match
 
     status = "✓" if is_correct else "✗"
