@@ -198,11 +198,10 @@ class cEBMF:
         tau_map = None if self.noise.type == NoiseType.CONSTANT else self.tau_map
         for k in range(self.model.K):
             self._update_factors(k, tau_map=tau_map, eps=NUMERICAL_EPS)
-            
-            
+
         self.update_tau()
         self._backfit()
-        
+
         self._cal_obj()
 
     @torch.no_grad()
@@ -403,7 +402,7 @@ class cEBMF:
 
 
         variance_term = second_moment - first_moment_sq
-    
+
         R2 = resid_mean_sq + variance_term  # NOT minus!
         R2 = (R2 * self.mask).clamp_min(0.0)
         return R2
@@ -454,7 +453,7 @@ class cEBMF:
         if dim is None:
             # scalar precision; also provide a full tau_map for convenience
             self.tau = tau
-            self.tau_map = torch.full((self.N, self.P), tau.item(), device=self.device, dtype=R2.dtype)
+            self.tau_map = torch.full((self.N, self.P), tau, device=self.device, dtype=R2.dtype)
             return
 
         view = (-1, 1) if dim == 1 else (1, -1)
@@ -523,7 +522,7 @@ class cEBMF:
 
         # K=1 case: return external covariates or intercept
         return external_cov if external_cov is not None else factors.new_ones(dim_size, 1)
-    
+
     @torch.no_grad()
     def _recompute_residual(self) -> None:
         """R := (Y0 - L F^T) ⊙ mask, NaNs -> 0."""
