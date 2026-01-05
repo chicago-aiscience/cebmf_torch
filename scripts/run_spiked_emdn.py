@@ -127,8 +127,8 @@ class EMDN(Prior):
         # EMDN doesn't have penalty parameter, so we don't pass it
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=False,
         ) as prof:
             with torch.profiler.record_function("emdn_posterior_means"):
@@ -187,8 +187,8 @@ class SpikedEMDN(Prior):
         # penalty is keyword-only in spiked_emdn_posterior_means (after *)
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=False,
         ) as prof:
             with torch.profiler.record_function("spiked_emdn_posterior_means"):
@@ -245,8 +245,8 @@ class CASH(Prior):
         # CASH uses num_classes instead of n_gaussians, and penalty is positional before device
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=False,
         ) as prof:
             with torch.profiler.record_function("cash_posterior_means"):
@@ -303,8 +303,8 @@ class CGB(Prior):
         # CGB has penalty as positional before model_param
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=False,
         ) as prof:
             with torch.profiler.record_function("cgb_posterior_means"):
@@ -360,8 +360,8 @@ class CGBSharp(Prior):
         # CGBSharp has penalty as positional before model_param
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=False,
         ) as prof:
             with torch.profiler.record_function("sharp_cgb_posterior_means"):
@@ -537,22 +537,16 @@ def record_profile(prof: torch.profiler.profile, prior_name: str, profile_output
     profile_output_dir: pathlib.Path
         The directory to save the profile.
     """
-    logging.info(f"{'='*80}")
-    logging.info(f"Profiling Results for '{prior_name}'")
-    logging.info(f"{'='*80}")
-    logging.info("--- Summary Table (sorted by CPU time) ---")
-    logging.info(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
-    logging.info(f"{'='*80}\n")
-
     summary_file = profile_output_dir / f"summary_{prior_name}.txt"
+    key_averages = prof.key_averages()
     with open(summary_file, "w") as f:
         f.write(f"Profiling Summary for '{prior_name}'\n")
         f.write("="*80 + "\n\n")
         f.write("Top 50 operations by CPU time:\n")
-        f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+        f.write(key_averages.table(sort_by="cpu_time_total", row_limit=50))
         # Add memory statistics if available
         try:
-            mem_table = prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=50)
+            mem_table = key_averages.table(sort_by="self_cpu_memory_usage", row_limit=50)
             f.write("\n\nTop 50 operations by memory usage:\n")
             f.write(mem_table)
         except (AttributeError, KeyError):
@@ -570,7 +564,6 @@ def plot_posterior_means(y: torch.Tensor, xobs: torch.Tensor, xtrue: torch.Tenso
     plt.xlabel("y")
     plt.ylabel("Effect")
     plt.savefig(out_dir / f"posterior_means_{prior_name}.png")
-
 
 def main():
     """Main function to profile the posterior means."""
@@ -603,7 +596,6 @@ def main():
     logging.info("Plotting posterior means...")
     plot_posterior_means(y, xobs, xtrue, posterior_means, prior.name, cfg.plots_output_dir)
     logging.info("Plotting posterior means completed.")
-
 
 
 if __name__ == "__main__":
