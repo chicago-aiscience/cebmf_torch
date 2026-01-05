@@ -156,3 +156,5 @@ profiles/
 *.prof
 *.lprof
 mprofile_*.dat
+
+plots/

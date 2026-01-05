@@ -567,6 +567,13 @@ def normal_means_loglik(
     torch.Tensor
         Scalar if reduce in {'sum','mean'}, else elementwise tensor.
     """
+    # Ensure all tensors are on the same device
+    device = x.device
+    x = x.to(device)
+    s = s.to(device)
+    Et = Et.to(device)
+    Et2 = Et2.to(device)
+
     # Ensure common dtype/device via broadcasting
     x, s, Et, Et2 = torch.broadcast_tensors(x, s, Et, Et2)
 

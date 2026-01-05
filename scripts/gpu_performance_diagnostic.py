@@ -51,7 +51,7 @@ def synchronize_device(device: str) -> None:
         torch.cuda.synchronize()
 
 
-def benchmark_device(data: torch.Tensor, device: str, niter: int = DEFAULT_ITERATIONS, K: int = DEFAULT_K) -> float:
+def benchmark_device(data: torch.Tensor, X_cov: torch.Tensor, device: str, niter: int = DEFAULT_ITERATIONS, K: int = DEFAULT_K) -> float:
     """Benchmark cEBMF on a specific device.
 
     Args:
@@ -66,7 +66,7 @@ def benchmark_device(data: torch.Tensor, device: str, niter: int = DEFAULT_ITERA
     print_section(f"Benchmarking on: {device.upper()}")
 
     # Warmup
-    model = cEBMF(data=data, device=torch.device(device), K=K)
+    model = cEBMF(data=data, device=torch.device(device), K=K, prior_L="cgb", X_l=X_cov)
     model.initialise_factors()
     model.fit(WARMUP_ITERATIONS)
 
@@ -263,6 +263,9 @@ def run_benchmark_for_dimension(N: int, P: int, niter: int = DEFAULT_ITERATIONS,
     print("="*SEPARATOR_WIDTH)
 
     data = torch.randn(N, P)
+    x = torch.randn(N)
+    y = torch.randn(N)
+    X_cov = torch.stack([x, y], dim=1)
     num_elements = N * P
     data_size_mb = num_elements * 4 / 1e6  # float32 = 4 bytes
 
@@ -280,15 +283,15 @@ def run_benchmark_for_dimension(N: int, P: int, niter: int = DEFAULT_ITERATIONS,
         result.item_time = check_synchronization_overhead()
 
     # Benchmark CPU
-    result.cpu_time = benchmark_device(data, "cpu", niter=niter, K=K)
+    result.cpu_time = benchmark_device(data, X_cov, "cpu", niter=niter, K=K)
 
     # Benchmark GPU/MPS if available
     if torch.cuda.is_available():
-        result.gpu_time = benchmark_device(data, "cuda", niter=niter, K=K)
+        result.gpu_time = benchmark_device(data, X_cov, "cuda", niter=niter, K=K)
         result.speedup = result.cpu_time / result.gpu_time
         print_speedup_results(result.speedup, "GPU")
     elif torch.backends.mps.is_available():
-        result.mps_time = benchmark_device(data, "mps", niter=niter, K=K)
+        result.mps_time = benchmark_device(data, X_cov, "mps", niter=niter, K=K)
         result.speedup = result.cpu_time / result.mps_time
         print_speedup_results(result.speedup, "MPS")
 
@@ -310,12 +313,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     dimensions = [
-        (500, 200),        # 100K elements
-        (1000, 500),       # 500K elements
-        (1600, 625),       # 1M elements
-        (5000, 2000),     # 10M elements
+        # (500, 200),        # 100K elements
+        # (1000, 500),       # 500K elements
+        # (1600, 625),       # 1M elements
+        # (5000, 2000),     # 10M elements
         (16000, 6250),     # 100M elements
-        (32000, 16000),    # 500M elements
+        # (32000, 16000),    # 500M elements
     ]
 
     json_data = {}
