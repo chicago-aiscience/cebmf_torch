@@ -525,7 +525,290 @@ def create_prior(name: str, penalty: float = 1.0, profile_output_dir: pathlib.Pa
             f"Supported priors: 'emdn', 'spiked_emdn', 'cgb_sharp', 'cash', 'cgb'"
         )
 
-def record_profile(prof: torch.profiler.profile, prior_name: str, profile_output_dir: pathlib.Path):
+def _find_table_header_and_separator(lines: list[str]) -> tuple[int | None, int | None]:
+    """Find the indices of the header and separator lines in a profiler table.
+
+    Parameters
+    ----------
+    lines : list[str]
+        Lines of the table string.
+
+    Returns
+    -------
+    tuple[int | None, int | None]
+        Tuple of (header_idx, separator_idx). Returns (None, None) if not found.
+    """
+    for i, line in enumerate(lines):
+        if 'Name' in line and any(col in line for col in ['CPU', 'CUDA', 'Mem', 'Calls']):
+            header_idx = i
+            separator_idx = i + 1 if (i + 1 < len(lines) and lines[i + 1].strip().startswith('-')) else None
+            return header_idx, separator_idx
+    return None, None
+
+
+def _find_column_boundaries(separator_line: str) -> list[int]:
+    """Find column boundary positions from a separator line (dash line).
+
+    Parameters
+    ----------
+    separator_line : str
+        The separator line containing dashes marking column boundaries.
+
+    Returns
+    -------
+    list[int]
+        List of column start positions.
+    """
+    boundaries = []
+    prev_char = ' '
+    for i, char in enumerate(separator_line):
+        if char == '-' and prev_char != '-':
+            boundaries.append(i)
+        prev_char = char
+    return boundaries
+
+
+def _extract_column_info(header_line: str, column_boundaries: list[int]) -> list[tuple[str, int, int]]:
+    """Extract column names and their positions from the header line.
+
+    Parameters
+    ----------
+    header_line : str
+        The header line containing column names.
+    column_boundaries : list[int]
+        List of column start positions.
+
+    Returns
+    -------
+    list[tuple[str, int, int]]
+        List of (column_name, start_pos, end_pos) tuples.
+    """
+    columns = []
+    for i in range(len(column_boundaries)):
+        start = column_boundaries[i]
+        # For the last column, extend to the end of the line
+        if i + 1 < len(column_boundaries):
+            end = column_boundaries[i + 1]
+        else:
+            end = len(header_line)
+        col_name = header_line[start:end].strip()
+        if col_name:  # Only add non-empty column names
+            columns.append((col_name, start, end))
+    return columns
+
+
+def _should_remove_column(col_name: str, columns_to_remove: list[str]) -> bool:
+    """Check if a column should be removed based on matching patterns.
+
+    Parameters
+    ----------
+    col_name : str
+        The column name to check.
+    columns_to_remove : list[str]
+        List of patterns to match against. Uses exact matching (case-insensitive)
+        or matches if the column name starts with the pattern followed by a space
+        and then specific suffix words (like "%", "total", "time", "avg").
+
+    Returns
+    -------
+    bool
+        True if the column should be removed, False otherwise.
+    """
+    col_lower = col_name.lower().strip()
+    for remove_pattern in columns_to_remove:
+        pattern_lower = remove_pattern.lower().strip()
+        # Exact match (case-insensitive)
+        if col_lower == pattern_lower:
+            return True
+        # Match if column name starts with pattern followed by space and then specific suffixes
+        # This allows "Self CPU %" to match "Self CPU" pattern, but "Self CPU Mem" won't match "Self CPU"
+        if col_lower.startswith(pattern_lower):
+            remaining = col_lower[len(pattern_lower):].strip()
+            # Match if remaining is empty, or starts with space followed by expected suffixes
+            # This prevents "Self CPU Mem" from matching "Self CPU" pattern
+            if not remaining:
+                return True
+            # Check for space followed by expected time-related suffixes (not "Mem")
+            if remaining.startswith((' %', ' total', ' time', ' avg')):
+                return True
+    return False
+
+
+def _filter_columns(
+    columns: list[tuple[str, int, int]],
+    columns_to_remove: list[str]
+) -> list[tuple[str, int, int]]:
+    """Filter columns to keep only those that should not be removed.
+
+    Parameters
+    ----------
+    columns : list[tuple[str, int, int]]
+        List of (column_name, start_pos, end_pos) tuples.
+    columns_to_remove : list[str]
+        List of patterns to match against for removal.
+
+    Returns
+    -------
+    list[tuple[str, int, int]]
+        List of columns to keep.
+    """
+    return [
+        (col_name, start, end)
+        for col_name, start, end in columns
+        if not _should_remove_column(col_name, columns_to_remove)
+    ]
+
+
+def _extract_column_from_line(line: str, start: int, end: int) -> str:
+    """Extract a column value from a line, handling edge cases.
+
+    Parameters
+    ----------
+    line : str
+        The line to extract from.
+    start : int
+        Start position of the column.
+    end : int
+        End position of the column.
+
+    Returns
+    -------
+    str
+        The extracted column value (stripped).
+    """
+    if end <= len(line):
+        return line[start:end].rstrip()
+    elif start < len(line):
+        return line[start:].rstrip()
+    else:
+        return ''
+
+
+def _is_separator_line(line: str) -> bool:
+    """Check if a line is a separator line (mostly dashes and spaces).
+
+    Parameters
+    ----------
+    line : str
+        The line to check.
+
+    Returns
+    -------
+    bool
+        True if the line appears to be a separator line.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Check if line is mostly dashes (at least 50% dashes)
+    dash_count = stripped.count('-')
+    return dash_count > len(stripped) * 0.5
+
+
+def _rebuild_table_line(
+    line: str,
+    line_idx: int,
+    header_idx: int,
+    separator_idx: int | None,
+    keep_cols: list[tuple[str, int, int]]
+) -> str:
+    """Rebuild a single table line with only the kept columns.
+
+    Parameters
+    ----------
+    line : str
+        The original line.
+    line_idx : int
+        Index of the line in the table.
+    header_idx : int
+        Index of the header line.
+    separator_idx : int | None
+        Index of the separator line, if it exists.
+    keep_cols : list[tuple[str, int, int]]
+        List of (column_name, start_pos, end_pos) tuples to keep.
+
+    Returns
+    -------
+    str
+        The rebuilt line with filtered columns, or empty string if line should be skipped.
+    """
+    if line_idx == header_idx:
+        # Header line: extract column names
+        parts = [line[start:end].rstrip() for _, start, end in keep_cols]
+        return '  '.join(parts)
+    elif line_idx == separator_idx:
+        # Main separator line: create dashes matching column widths
+        parts = ['-' * (end - start) for _, start, end in keep_cols]
+        return '  '.join(parts)
+    elif _is_separator_line(line):
+        # Other separator lines: skip them
+        return ''
+    elif line.strip() and not line.strip().startswith('-'):
+        # Data line: extract column values
+        parts = [_extract_column_from_line(line, start, end) for _, start, end in keep_cols]
+        return '  '.join(parts)
+    else:
+        # Empty lines: return as-is
+        return line
+
+
+def filter_table_columns(table_str: str, columns_to_remove: list[str]) -> str:
+    """Remove specific columns from a PyTorch profiler table string.
+
+    Parameters
+    ----------
+    table_str : str
+        The table string from profiler.key_averages().table()
+    columns_to_remove : list[str]
+        List of column names to remove (e.g., ["Self CPU %", "CPU total %", "Self CUDA %", "CUDA total %"])
+        Partial matches are supported (e.g., "%" will match all percentage columns)
+
+    Returns
+    -------
+    str
+        The filtered table string with specified columns removed.
+    """
+    if not columns_to_remove:
+        return table_str
+
+    lines = table_str.split('\n')
+    if len(lines) < 2:
+        return table_str
+
+    # Find header and separator line indices
+    header_idx, separator_idx = _find_table_header_and_separator(lines)
+    if header_idx is None or separator_idx is None:
+        return table_str
+
+    # Extract column information
+    separator_line = lines[separator_idx]
+    header_line = lines[header_idx]
+
+    column_boundaries = _find_column_boundaries(separator_line)
+    if len(column_boundaries) < 2:
+        return table_str
+
+    columns = _extract_column_info(header_line, column_boundaries)
+
+    # Filter columns
+    keep_cols = _filter_columns(columns, columns_to_remove)
+    if len(keep_cols) == len(columns):
+        return table_str  # Nothing removed
+
+    # Rebuild table with kept columns only, filtering out skipped separator lines
+    result_lines = []
+    for line_idx, line in enumerate(lines):
+        rebuilt_line = _rebuild_table_line(line, line_idx, header_idx, separator_idx, keep_cols)
+        if rebuilt_line:  # Filter out empty strings (skipped separator lines)
+            result_lines.append(rebuilt_line)
+
+    return '\n'.join(result_lines)
+
+def record_profile(
+    prof: torch.profiler.profile,
+    prior_name: str,
+    profile_output_dir: pathlib.Path,
+):
     """Record the profile of the model fitting process using torch.profiler.
 
     Parameters
@@ -536,19 +819,34 @@ def record_profile(prof: torch.profiler.profile, prior_name: str, profile_output
         The name of the prior.
     profile_output_dir: pathlib.Path
         The directory to save the profile.
+    columns_to_remove: list[str] | None, optional
+        List of column names to remove from the output tables.
+        Common examples: ["Self CPU %", "CPU total %", "Self CUDA %", "CUDA total %", "CPU Mem", "Self CPU Mem"]
+        Partial matches are supported (e.g., "%" matches all percentage columns).
+        Default is None (no columns removed).
     """
+
     summary_file = profile_output_dir / f"summary_{prior_name}.txt"
-    key_averages = prof.key_averages()
+    key_averages = prof.key_averages(group_by_input_shape=True)
     with open(summary_file, "w") as f:
         f.write(f"Profiling Summary for '{prior_name}'\n")
         f.write("="*80 + "\n\n")
-        f.write("Top 50 operations by CPU time:\n")
-        f.write(key_averages.table(sort_by="cpu_time_total", row_limit=50))
-        # Add memory statistics if available
+
+        # Add CUDA time sorted table to show GPU operations
+        columns_to_remove = ["CPU Mem", "Self CPU Mem", "CUDA Mem", "Self CUDA Mem"]
         try:
-            mem_table = key_averages.table(sort_by="self_cpu_memory_usage", row_limit=50)
+            cuda_table = key_averages.table(sort_by="cuda_time", row_limit=50)
+            f.write("\n\nTop 50 operations by CUDA time (GPU operations):\n")
+            f.write(filter_table_columns(cuda_table, columns_to_remove))
+        except (AttributeError, KeyError):
+            pass  # CUDA profiling not available
+
+        # Add memory statistics if available
+        columns_to_remove = ["Self CPU %", "Self CPU", "CPU total %", "CPU total", "CPU time avg", "Self CUDA", "Self CUDA %", "CUDA total ", "CUDA time avg"]
+        try:
+            mem_table = key_averages.table(sort_by="cuda_memory_usage", row_limit=50)
             f.write("\n\nTop 50 operations by memory usage:\n")
-            f.write(mem_table)
+            f.write(filter_table_columns(mem_table, columns_to_remove))
         except (AttributeError, KeyError):
             pass  # Memory profiling not available
     logging.info(f"Detailed summary exported to: {summary_file}")
@@ -559,7 +857,7 @@ def plot_posterior_means(y: torch.Tensor, xobs: torch.Tensor, xtrue: torch.Tenso
     plt.figure(figsize=(15,6))
     plt.scatter(y, xobs, alpha=0.3, label=r"$x_{\rm obs}$")
     plt.scatter(y, xtrue, c="green", s=3, label=r"$x_{\rm true}$")
-    plt.scatter(y, posterior_means.post_mean, c="red", s=3, label=f"{prior_name} posterior mean")
+    plt.scatter(y, posterior_means.post_mean.cpu(), c="red", s=3, label=f"{prior_name} posterior mean")
     plt.legend()
     plt.xlabel("y")
     plt.ylabel("Effect")
