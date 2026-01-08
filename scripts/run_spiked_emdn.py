@@ -385,7 +385,7 @@ def create_args() -> argparse.ArgumentParser:
     """Create an ArgumentParser from the Config dataclass."""
     parser = argparse.ArgumentParser(description="Profile the posterior means of the spiked EMDN")
     parser.add_argument("--env-file", type=pathlib.Path, default=pathlib.Path(".env"), help="Path to environment file")
-    parser.add_argument("--prior-name", type=str, default="spiked_emdn", choices=["emdn", "spiked_emdn", "cgb_sharp", "cash", "cgb", "cgb_sharp"], help="Prior distribution to profile with")
+    parser.add_argument("--prior-name", type=str, default="spiked_emdn", choices=["emdn", "spiked_emdn", "cash", "cgb", "cgb_sharp"], help="Prior distribution to profile with")
     parser.add_argument("--profile-output-dir", type=pathlib.Path, default=pathlib.Path("./profiles"), help="Path to output directory where profiling results will be saved")
     parser.add_argument("--plots-output-dir", type=pathlib.Path, default=pathlib.Path("./plots"), help="Path to output directory where plots will be saved")
     return parser
